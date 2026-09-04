@@ -6,7 +6,9 @@ in later stages of the application.
 
 from __future__ import annotations
 
+import ast
 import os
+import re
 from collections.abc import Iterator
 from pathlib import Path
 from typing import TypedDict
@@ -130,6 +132,261 @@ def _split_into_chunks(text: str, chunk_size: int) -> Iterator[tuple[int, int, s
         yield pending
 
 
+def _node_start_line(node: ast.AST) -> int:
+    """Return 1-based start line of an AST node, including decorators."""
+
+    if (
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        and node.decorator_list
+    ):
+        return min([node.lineno] + [d.lineno for d in node.decorator_list])
+    return getattr(node, "lineno", 1)
+
+
+def _node_end_line(node: ast.AST) -> int:
+    """Return 1-based end line of an AST node."""
+
+    return getattr(node, "end_lineno", _node_start_line(node))
+
+
+def _extract_file_imports(tree: ast.Module) -> list[ast.Import | ast.ImportFrom]:
+    """Collect top-level import statements from a parsed module."""
+
+    return [node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))]
+
+
+def _get_relevant_imports(
+    imports: list[ast.Import | ast.ImportFrom],
+    code: str,
+) -> list[str]:
+    """Return formatted import statements for symbols referenced in ``code``."""
+
+    identifiers = set(re.findall(r"\b[A-Za-z_]\w*\b", code))
+    relevant: list[str] = []
+
+    for node in imports:
+        if isinstance(node, ast.Import):
+            matching = [
+                alias
+                for alias in node.names
+                if (alias.asname or alias.name.split(".")[0]) in identifiers
+                or alias.name in identifiers
+            ]
+            if matching:
+                stmt = ast.unparse(ast.Import(names=matching))
+                if stmt not in code:
+                    relevant.append(stmt)
+        elif isinstance(node, ast.ImportFrom):
+            matching = [
+                alias
+                for alias in node.names
+                if (alias.asname or alias.name) in identifiers
+                or alias.name == "*"
+            ]
+            if matching:
+                stmt = ast.unparse(
+                    ast.ImportFrom(
+                        module=node.module,
+                        names=matching,
+                        level=node.level,
+                    )
+                )
+                if stmt not in code:
+                    relevant.append(stmt)
+
+    return relevant
+
+
+def _format_chunk_text(file_path: str, code: str, relevant_imports: list[str]) -> str:
+    """Prepend a short header with file path and relevant imports to code."""
+
+    header_lines = [f"# File: {file_path}"]
+    if relevant_imports:
+        header_lines.extend(relevant_imports)
+    return "\n".join(header_lines) + "\n\n" + code
+
+
+def _split_python_file(
+    file_path: str,
+    text: str,
+    chunk_size: int,
+) -> list[RepositoryChunk]:
+    """Split Python source text into code-aware chunks using AST boundaries."""
+
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, MemoryError, RecursionError):
+        # Fallback to fixed-size line splitter for syntax-invalid Python
+        return [
+            {
+                "file_path": file_path,
+                "start_line": start,
+                "end_line": end,
+                "text": chunk_text,
+            }
+            for start, end, chunk_text in _split_into_chunks(text, chunk_size)
+        ]
+
+    source_lines = text.splitlines()
+    if not source_lines:
+        return []
+    if not tree.body:
+        if text.strip():
+            return [
+                {
+                    "file_path": file_path,
+                    "start_line": start,
+                    "end_line": end,
+                    "text": chunk_text,
+                }
+                for start, end, chunk_text in _split_into_chunks(text, chunk_size)
+            ]
+        return []
+
+    file_imports = _extract_file_imports(tree)
+    chunks: list[RepositoryChunk] = []
+    current_module_nodes: list[ast.AST] = []
+
+    def flush_module_nodes() -> None:
+        nonlocal current_module_nodes
+        if not current_module_nodes:
+            return
+        start = _node_start_line(current_module_nodes[0])
+        end = _node_end_line(current_module_nodes[-1])
+        code = "\n".join(source_lines[start - 1 : end])
+        current_module_nodes = []
+        if not code.strip():
+            return
+
+        if len(code) <= chunk_size:
+            rel = _get_relevant_imports(file_imports, code)
+            chunks.append(
+                {
+                    "file_path": file_path,
+                    "start_line": start,
+                    "end_line": end,
+                    "text": _format_chunk_text(file_path, code, rel),
+                }
+            )
+        else:
+            for s, e, piece in _split_into_chunks(code, chunk_size):
+                rel = _get_relevant_imports(file_imports, piece)
+                chunks.append(
+                    {
+                        "file_path": file_path,
+                        "start_line": start + s - 1,
+                        "end_line": start + e - 1,
+                        "text": _format_chunk_text(file_path, piece, rel),
+                    }
+                )
+
+    def process_class(node: ast.ClassDef) -> None:
+        start = _node_start_line(node)
+        end = _node_end_line(node)
+        class_code = "\n".join(source_lines[start - 1 : end])
+
+        # A class is returned as one meaningful unit where size permits
+        if len(class_code) <= chunk_size:
+            rel = _get_relevant_imports(file_imports, class_code)
+            chunks.append(
+                {
+                    "file_path": file_path,
+                    "start_line": start,
+                    "end_line": end,
+                    "text": _format_chunk_text(file_path, class_code, rel),
+                }
+            )
+            return
+
+        # Where size does not permit, split on method/child boundaries
+        child_nodes = [
+            n
+            for n in node.body
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        ]
+        if not child_nodes:
+            for s, e, piece in _split_into_chunks(class_code, chunk_size):
+                rel = _get_relevant_imports(file_imports, piece)
+                chunks.append(
+                    {
+                        "file_path": file_path,
+                        "start_line": start + s - 1,
+                        "end_line": start + e - 1,
+                        "text": _format_chunk_text(file_path, piece, rel),
+                    }
+                )
+            return
+
+        first_child_start = _node_start_line(child_nodes[0])
+        if first_child_start > start:
+            preamble = "\n".join(source_lines[start - 1 : first_child_start - 1])
+            if preamble.strip():
+                if len(preamble) <= chunk_size:
+                    rel = _get_relevant_imports(file_imports, preamble)
+                    chunks.append(
+                        {
+                            "file_path": file_path,
+                            "start_line": start,
+                            "end_line": first_child_start - 1,
+                            "text": _format_chunk_text(file_path, preamble, rel),
+                        }
+                    )
+                else:
+                    for s, e, piece in _split_into_chunks(preamble, chunk_size):
+                        rel = _get_relevant_imports(file_imports, piece)
+                        chunks.append(
+                            {
+                                "file_path": file_path,
+                                "start_line": start + s - 1,
+                                "end_line": start + e - 1,
+                                "text": _format_chunk_text(file_path, piece, rel),
+                            }
+                        )
+
+        for child in child_nodes:
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                c_start = _node_start_line(child)
+                c_end = _node_end_line(child)
+                c_code = "\n".join(source_lines[c_start - 1 : c_end])
+                rel = _get_relevant_imports(file_imports, c_code)
+                # A function is never cut in half
+                chunks.append(
+                    {
+                        "file_path": file_path,
+                        "start_line": c_start,
+                        "end_line": c_end,
+                        "text": _format_chunk_text(file_path, c_code, rel),
+                    }
+                )
+            elif isinstance(child, ast.ClassDef):
+                process_class(child)
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            flush_module_nodes()
+            start = _node_start_line(node)
+            end = _node_end_line(node)
+            func_code = "\n".join(source_lines[start - 1 : end])
+            rel = _get_relevant_imports(file_imports, func_code)
+            # A function is never cut in half
+            chunks.append(
+                {
+                    "file_path": file_path,
+                    "start_line": start,
+                    "end_line": end,
+                    "text": _format_chunk_text(file_path, func_code, rel),
+                }
+            )
+        elif isinstance(node, ast.ClassDef):
+            flush_module_nodes()
+            process_class(node)
+        else:
+            current_module_nodes.append(node)
+
+    flush_module_nodes()
+    return chunks
+
+
 def load_repository(
     repository_path: str | os.PathLike[str],
     *,
@@ -157,15 +414,18 @@ def load_repository(
             continue
 
         relative_path = path.relative_to(root).as_posix()
-        for start_line, end_line, chunk_text in _split_into_chunks(text, chunk_size):
-            chunks.append(
-                {
-                    "file_path": relative_path,
-                    "start_line": start_line,
-                    "end_line": end_line,
-                    "text": chunk_text,
-                }
-            )
+        if path.suffix.lower() == ".py":
+            chunks.extend(_split_python_file(relative_path, text, chunk_size))
+        else:
+            for start_line, end_line, chunk_text in _split_into_chunks(text, chunk_size):
+                chunks.append(
+                    {
+                        "file_path": relative_path,
+                        "start_line": start_line,
+                        "end_line": end_line,
+                        "text": chunk_text,
+                    }
+                )
     return chunks
 
 
@@ -178,3 +438,4 @@ __all__ = [
     "iter_supported_files",
     "load_repository",
 ]
+
