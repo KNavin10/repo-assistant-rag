@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Sequence
+from uuid import uuid4
 
 from .graph import build_graph
 from .model import groq_model
@@ -40,7 +41,13 @@ def run(
         "status": "running",
         "errors": [],
     }
-    config = {"configurable": {"thread_id": thread_id}}
+    request_id = str(uuid4())
+    config = {
+        "run_name": "repo-assistant-question",
+        "tags": ["cli"],
+        "metadata": {"request_id": request_id, "thread_id": thread_id},
+        "configurable": {"thread_id": thread_id},
+    }
     return graph.invoke(initial_state, config)
 
 
