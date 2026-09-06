@@ -4,3 +4,6 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .ruff_cache/
+pytest_temp/
+.day10-test-temp/
+*-test-temp/

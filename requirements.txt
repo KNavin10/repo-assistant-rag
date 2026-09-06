@@ -1,4 +1,9 @@
 # Add Python dependencies here.
 langgraph>=0.2.0
+langsmith>=0.4
 groq>=1.0.0
 python-dotenv>=1.0.0
+PyYAML>=6.0
+sentence-transformers
+rank-bm25
+mcp[cli]>=2,<3

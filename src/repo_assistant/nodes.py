@@ -13,7 +13,7 @@ from typing import Any, cast
 
 from .loader import RepositoryChunk
 from .loader import load_repository as _load_repository
-from .retrieval import DEFAULT_TOP_K, retrieve_chunks
+from .retrieval import DEFAULT_HYBRID_TOP_K, DEFAULT_MIN_VECTOR_SCORE, hybrid_search
 from .state import Route
 
 State = Mapping[str, object]
@@ -97,7 +97,12 @@ def route_question(state: State) -> StateUpdate:
     return {"route": route, "status": "running", "errors": []}
 
 
-def retrieve_context(state: State, *, top_k: int = DEFAULT_TOP_K) -> StateUpdate:
+def retrieve_context(
+    state: State,
+    *,
+    top_k: int = DEFAULT_HYBRID_TOP_K,
+    min_vector_score: float | None = DEFAULT_MIN_VECTOR_SCORE,
+) -> StateUpdate:
     """Retrieve the most relevant loaded chunks for the current question."""
 
     question = state.get("question")
@@ -108,7 +113,12 @@ def retrieve_context(state: State, *, top_k: int = DEFAULT_TOP_K) -> StateUpdate
         return _error_state("Repository chunks are invalid.")
 
     chunks = cast(Sequence[RepositoryChunk], raw_chunks)
-    matches = retrieve_chunks(question, chunks, top_k=top_k)
+    matches = hybrid_search(
+        question,
+        chunks,
+        top_k=top_k,
+        min_vector_score=min_vector_score,
+    )
 
     # Summary questions often contain no source-code keywords. Use the first
     # stable chunks as bounded overview evidence when keyword retrieval finds
@@ -133,12 +143,81 @@ def _extract_citations(answer: str) -> list[str]:
     for match in _CITATION_RE.finditer(answer):
         start = int(match.group("start"))
         end = int(match.group("end"))
-        if start > end:
+        if start < 1 or start > end:
             continue
         citation = f"{match.group('path')}:{start}-{end}"
         if citation not in citations:
             citations.append(citation)
     return citations
+
+
+def _validate_and_extract_citations(
+    answer: str,
+    chunks: Sequence[RepositoryChunk],
+    repo_path: str | Path | None = None,
+) -> tuple[list[str], str | None]:
+    """Validate citations against line rules, retrieved chunks, and repository.
+
+    Returns a tuple of (unique_citations, error_message). If validation fails,
+    error_message describes the reason and citations will be empty.
+    """
+
+    matches = list(_CITATION_RE.finditer(answer))
+    if not matches:
+        return [], "Answer generation must include a citation in path:start_line-end_line format."
+
+    citations: list[str] = []
+    repo_root = (
+        Path(repo_path)
+        if isinstance(repo_path, (str, Path)) and str(repo_path).strip()
+        else None
+    )
+
+    for match in matches:
+        path = match.group("path")
+        start = int(match.group("start"))
+        end = int(match.group("end"))
+
+        if start < 1:
+            return [], f"Invalid citation line range start must be at least 1: {path}:{start}-{end}"
+        if start > end:
+            return (
+                [],
+                f"Invalid citation line range: start line {start} exceeds end line {end} ({path}:{start}-{end})",
+            )
+
+        # Every citation must correspond to one of the retrieved chunks
+        corresponds = any(
+            chunk.get("file_path") == path
+            and chunk.get("start_line", 0) <= start
+            and end <= chunk.get("end_line", 0)
+            for chunk in chunks
+        )
+        if not corresponds:
+            return [], f"Citation does not correspond to any retrieved chunk: {path}:{start}-{end}"
+
+        # Every cited path must exist under the selected repository
+        if repo_root is not None:
+            cited_file = repo_root / path
+            if not cited_file.is_file():
+                return [], f"Cited path does not exist under the selected repository: {path}"
+            try:
+                line_count = len(
+                    cited_file.read_text(encoding="utf-8", errors="replace").splitlines()
+                )
+                if end > line_count:
+                    return (
+                        [],
+                        f"Citation line range {start}-{end} exceeds file length ({line_count} lines): {path}",
+                    )
+            except OSError as exc:
+                return [], f"Could not inspect cited file {path}: {exc}"
+
+        citation = f"{path}:{start}-{end}"
+        if citation not in citations:
+            citations.append(citation)
+
+    return citations, None
 
 
 def generate_answer(state: State, model_fn: ModelFn | None = None) -> StateUpdate:
@@ -175,11 +254,15 @@ def generate_answer(state: State, model_fn: ModelFn | None = None) -> StateUpdat
     if not isinstance(answer, str) or not answer.strip():
         return _error_state("Answer generation returned no text.")
 
-    citations = _extract_citations(answer)
-    if not citations:
-        return _error_state(
-            "Answer generation must include a citation in path:start_line-end_line format."
-        )
+    raw_repo = state.get("repo_path")
+    repo_path = raw_repo if isinstance(raw_repo, (str, Path)) else None
+    citations, error_message = _validate_and_extract_citations(
+        answer,
+        chunks,
+        repo_path=repo_path,
+    )
+    if error_message is not None:
+        return _error_state(error_message)
 
     return {
         "answer": answer,

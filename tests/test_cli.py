@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+from uuid import UUID
 
+from repo_assistant import cli
 from repo_assistant.cli import main
 
 
@@ -59,3 +61,26 @@ def test_cli_prints_insufficient_data(tmp_path: Path, capsys) -> None:
 
     assert exit_code == 0
     assert capsys.readouterr().out == "INSUFFICIENT_DATA\n"
+
+
+def test_run_configures_langsmith_metadata(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeGraph:
+        def invoke(self, state: dict[str, object], config: dict[str, object]) -> dict[str, object]:
+            captured["state"] = state
+            captured["config"] = config
+            return {"status": "insufficient_data"}
+
+    monkeypatch.setattr(cli, "build_graph", lambda model_fn: FakeGraph())
+
+    result = cli.run("tests/fixtures/eval_repo", "Where is validation?", "day11-demo-001")
+
+    assert result == {"status": "insufficient_data"}
+    config = captured["config"]
+    assert isinstance(config, dict)
+    assert config["run_name"] == "repo-assistant-question"
+    assert config["tags"] == ["cli"]
+    assert config["configurable"] == {"thread_id": "day11-demo-001"}
+    assert config["metadata"]["thread_id"] == "day11-demo-001"
+    UUID(config["metadata"]["request_id"])
