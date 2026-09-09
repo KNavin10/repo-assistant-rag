@@ -7,11 +7,14 @@ in later stages of the application.
 from __future__ import annotations
 
 import ast
+import fnmatch
 import os
 import re
 from collections.abc import Iterator
 from pathlib import Path
 from typing import TypedDict
+
+from .security import is_sensitive_file, resolve_repository_root
 
 SUPPORTED_EXTENSIONS = frozenset(
     {".py", ".ts", ".tsx", ".js", ".html", ".css", ".md", ".json", ".yaml", ".yml"}
@@ -21,8 +24,9 @@ IGNORED_DIRECTORIES = frozenset(
 )
 
 DEFAULT_MAX_FILE_SIZE = 1_048_576  # 1 MiB
+DEFAULT_MAX_FILES = 1_000
+DEFAULT_MAX_TOTAL_BYTES = 20 * 1_048_576  # 20 MiB
 DEFAULT_CHUNK_SIZE = 1_200  # characters
-
 
 class RepositoryChunk(TypedDict):
     """A searchable piece of a repository file.
@@ -38,16 +42,65 @@ class RepositoryChunk(TypedDict):
     text: str
 
 
-def iter_supported_files(repository_path: str | os.PathLike[str]) -> Iterator[Path]:
+def _read_gitignore_rules(root: Path) -> list[tuple[str, bool, bool]]:
+    """Read common root ``.gitignore`` rules without executing Git."""
+
+    ignore_file = root / ".gitignore"
+    try:
+        lines = ignore_file.read_text(encoding="utf-8-sig").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return []
+
+    rules: list[tuple[str, bool, bool]] = []
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        negated = line.startswith("!")
+        if negated:
+            line = line[1:]
+        line = line.replace("\\", "/").lstrip("/")
+        directory_only = line.endswith("/")
+        pattern = line.rstrip("/")
+        if pattern:
+            rules.append((pattern, negated, directory_only))
+    return rules
+
+
+def _matches_gitignore(relative_path: str, rules: list[tuple[str, bool, bool]]) -> bool:
+    """Apply a practical subset of root gitignore rules to a POSIX path."""
+
+    ignored = False
+    parts = relative_path.split("/")
+    for pattern, negated, directory_only in rules:
+        if "/" in pattern:
+            matched = fnmatch.fnmatchcase(relative_path, pattern)
+            if directory_only:
+                matched = matched or relative_path.startswith(f"{pattern}/")
+        else:
+            matched = any(fnmatch.fnmatchcase(part, pattern) for part in parts)
+        if matched:
+            ignored = not negated
+    return ignored
+
+
+def iter_supported_files(
+    repository_path: str | os.PathLike[str],
+    *,
+    max_files: int = DEFAULT_MAX_FILES,
+) -> Iterator[Path]:
     """Yield supported files below ``repository_path`` in stable order.
 
     Ignored directory names are pruned before walking, so files below them
     are never opened.
     """
 
-    root = Path(repository_path)
-    if not root.is_dir():
-        raise NotADirectoryError(f"Repository path is not a directory: {root}")
+    if isinstance(max_files, bool) or not isinstance(max_files, int) or max_files <= 0:
+        raise ValueError("max_files must be a positive integer")
+
+    root = resolve_repository_root(repository_path)
+    gitignore_rules = _read_gitignore_rules(root)
+    yielded = 0
 
     for current_dir, directory_names, file_names in os.walk(root, topdown=True):
         directory_names[:] = sorted(
@@ -55,8 +108,19 @@ def iter_supported_files(repository_path: str | os.PathLike[str]) -> Iterator[Pa
         )
         for file_name in sorted(file_names):
             path = Path(current_dir) / file_name
-            if path.suffix.lower() in SUPPORTED_EXTENSIONS:
-                yield path
+            relative_path = path.relative_to(root).as_posix()
+            if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                continue
+            if is_sensitive_file(path) or _matches_gitignore(relative_path, gitignore_rules):
+                continue
+            try:
+                path.resolve(strict=True).relative_to(root)
+            except (OSError, ValueError):
+                continue
+            yielded += 1
+            if yielded > max_files:
+                raise ValueError(f"Repository scan exceeds the maximum of {max_files} files.")
+            yield path
 
 
 def _read_text(path: Path, max_file_size: int) -> str | None:
@@ -392,6 +456,8 @@ def load_repository(
     *,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     max_file_size: int = DEFAULT_MAX_FILE_SIZE,
+    max_files: int = DEFAULT_MAX_FILES,
+    max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES,
 ) -> list[RepositoryChunk]:
     """Load a repository directory, such as ``policies/my-repository``.
 
@@ -405,10 +471,24 @@ def load_repository(
         raise ValueError("chunk_size must be greater than zero")
     if max_file_size < 0:
         raise ValueError("max_file_size must not be negative")
+    if isinstance(max_total_bytes, bool) or not isinstance(max_total_bytes, int) or max_total_bytes <= 0:
+        raise ValueError("max_total_bytes must be a positive integer")
 
-    root = Path(repository_path)
+    root = resolve_repository_root(repository_path)
     chunks: list[RepositoryChunk] = []
-    for path in iter_supported_files(root):
+    total_bytes = 0
+    for path in iter_supported_files(root, max_files=max_files):
+        try:
+            file_size = path.stat().st_size
+        except OSError:
+            continue
+        if file_size > max_file_size:
+            continue
+        if total_bytes + file_size > max_total_bytes:
+            raise ValueError(
+                f"Repository scan exceeds the maximum of {max_total_bytes} total bytes."
+            )
+        total_bytes += file_size
         text = _read_text(path, max_file_size)
         if text is None:
             continue
@@ -431,11 +511,13 @@ def load_repository(
 
 __all__ = [
     "DEFAULT_CHUNK_SIZE",
+    "DEFAULT_MAX_FILES",
     "DEFAULT_MAX_FILE_SIZE",
+    "DEFAULT_MAX_TOTAL_BYTES",
     "IGNORED_DIRECTORIES",
     "SUPPORTED_EXTENSIONS",
     "RepositoryChunk",
+    "is_sensitive_file",
     "iter_supported_files",
     "load_repository",
 ]
-

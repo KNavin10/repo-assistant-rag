@@ -64,8 +64,83 @@ def test_binary_and_oversized_files_are_skipped(tmp_path: Path) -> None:
     assert set(chunks[0].keys()) == {"file_path", "start_line", "end_line", "text"}
 
 
+def test_sensitive_files_are_excluded(tmp_path: Path) -> None:
+    visible = tmp_path / "config" / "settings.json"
+    visible.parent.mkdir(parents=True)
+    visible.write_text('{"environment": "test"}\n', encoding="utf-8")
+
+    sensitive_files = {
+        ".env": "GROQ_API_KEY=should-not-load\n",
+        ".env.local": "TOKEN=should-not-load\n",
+        ".envrc": "TOKEN=should-not-load\n",
+        "credentials.json": '{"password": "should-not-load"}\n',
+        "service-secret.yaml": "api_key: should-not-load\n",
+        "service-account.yml": "private_key: should-not-load\n",
+        "server.key": "private key material\n",
+        "server.pem": "certificate material\n",
+        "server.crt": "certificate material\n",
+    }
+    for relative_path, contents in sensitive_files.items():
+        (tmp_path / relative_path).write_text(contents, encoding="utf-8")
+
+    chunks = load_repository(tmp_path)
+
+    assert {chunk["file_path"] for chunk in chunks} == {"config/settings.json"}
+
+
+def test_root_gitignore_patterns_are_applied(tmp_path: Path) -> None:
+    (tmp_path / ".gitignore").write_text(
+        "ignored.json\nprivate/*.yaml\nignored-directory/\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "visible.py").write_text("visible = True\n", encoding="utf-8")
+    (tmp_path / "ignored.json").write_text('{"hidden": true}\n', encoding="utf-8")
+    private = tmp_path / "private"
+    private.mkdir()
+    (private / "settings.yaml").write_text("hidden: true\n", encoding="utf-8")
+    ignored_directory = tmp_path / "ignored-directory"
+    ignored_directory.mkdir()
+    (ignored_directory / "hidden.py").write_text("hidden = True\n", encoding="utf-8")
+
+    paths = [path.relative_to(tmp_path).as_posix() for path in iter_supported_files(tmp_path)]
+
+    assert paths == ["visible.py"]
+
+
+def test_scan_file_limit_is_an_explicit_error(tmp_path: Path) -> None:
+    for name in ("a.py", "b.py", "c.py"):
+        (tmp_path / name).write_text(f"value = '{name}'\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="maximum of 2 files"):
+        load_repository(tmp_path, max_files=2)
+
+
+def test_scan_total_byte_limit_is_an_explicit_error(tmp_path: Path) -> None:
+    (tmp_path / "a.py").write_text("aaaa\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("bbbb\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="maximum of 7 total bytes"):
+        load_repository(tmp_path, max_total_bytes=7)
+
+
+@pytest.mark.parametrize(
+    ("argument", "value", "message"),
+    [
+        ("max_files", 0, "max_files must be a positive integer"),
+        ("max_total_bytes", 0, "max_total_bytes must be a positive integer"),
+    ],
+)
+def test_scan_limits_require_positive_integers(
+    tmp_path: Path, argument: str, value: int, message: str
+) -> None:
+    (tmp_path / "source.py").write_text("value = 1\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        load_repository(tmp_path, **{argument: value})
+
+
 def test_invalid_repository_path_raises() -> None:
-    with pytest.raises(NotADirectoryError):
+    with pytest.raises(FileNotFoundError):
         load_repository("path-that-does-not-exist")
 
 
@@ -185,4 +260,3 @@ def test_chunk_header_includes_path_and_relevant_imports(tmp_path: Path) -> None
     assert "from math import pi" not in func_chunk["text"]
     assert func_chunk["start_line"] == 5
     assert func_chunk["end_line"] == 6
-

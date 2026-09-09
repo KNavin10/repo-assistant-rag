@@ -4,34 +4,53 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 from mcp.server import MCPServer
+from pydantic import Field
 
 try:
     from .embeddings import EmbeddingFunction, SentenceTransformerAdapter
     from .loader import SUPPORTED_EXTENSIONS, load_repository
-    from .nodes import ModelFn, _extract_citations
+    from .nodes import ModelFn, _validate_and_extract_citations
     from .retrieval import hybrid_search
+    from .security import (
+        resolve_repository_file,
+        resolve_repository_root,
+        validate_question,
+        validate_top_k,
+    )
 except (ImportError, ValueError):
     from repo_assistant.embeddings import EmbeddingFunction, SentenceTransformerAdapter
     from repo_assistant.loader import SUPPORTED_EXTENSIONS, load_repository
-    from repo_assistant.nodes import ModelFn, _extract_citations
+    from repo_assistant.nodes import ModelFn, _validate_and_extract_citations
     from repo_assistant.retrieval import hybrid_search
+    from repo_assistant.security import (
+        resolve_repository_file,
+        resolve_repository_root,
+        validate_question,
+        validate_top_k,
+    )
 
 
 def create_mcp_server(
     *,
     model_fn: ModelFn | None = None,
     embedding_fn: EmbeddingFunction | None = None,
+    allowed_root: str | os.PathLike[str] | None = None,
     name: str = "repo-assistant",
 ) -> MCPServer:
     """Create and configure the repository assistant MCP server."""
 
     server = MCPServer(name=name)
+    boundary_root = resolve_repository_root(allowed_root or Path.cwd())
 
     @server.tool()
-    def search_code(repo_path: str, question: str, k: int = 4) -> dict[str, Any]:
+    def search_code(
+        repo_path: str,
+        question: Annotated[str, Field(min_length=1, max_length=500)],
+        k: Annotated[int, Field(strict=True, ge=1, le=8)] = 4,
+    ) -> dict[str, Any]:
         """Search repository code using hybrid retrieval and return ranked chunks with citations.
 
         Args:
@@ -39,11 +58,9 @@ def create_mcp_server(
             question: Search query or technical question.
             k: Maximum number of ranked chunks to return (default: 4).
         """
-        root = Path(repo_path)
-        if not root.exists():
-            raise FileNotFoundError(f"Repository path does not exist: {repo_path}")
-        if not root.is_dir():
-            raise NotADirectoryError(f"Repository path is not a directory: {repo_path}")
+        root = resolve_repository_root(repo_path, allowed_root=boundary_root)
+        bounded_question = validate_question(question)
+        bounded_k = validate_top_k(k)
 
         chunks = load_repository(root)
         if not chunks:
@@ -55,9 +72,9 @@ def create_mcp_server(
             else SentenceTransformerAdapter()
         )
         matches = hybrid_search(
-            question,
+            bounded_question,
             chunks,
-            top_k=k,
+            top_k=bounded_k,
             embedding_fn=embedder,
         )
 
@@ -80,22 +97,20 @@ def create_mcp_server(
         }
 
     @server.tool()
-    def explain_file(repo_path: str, file_path: str) -> dict[str, Any]:
+    def explain_file(
+        repo_path: str,
+        file_path: str,
+        allow_external_model: bool = False,
+    ) -> dict[str, Any]:
         """Explain one supported repository file and return explanation with citations.
 
         Args:
             repo_path: Absolute or relative path to the repository directory.
             file_path: Relative path to the file within the repository.
+            allow_external_model: Explicit consent to send selected chunks to Groq.
         """
-        root = Path(repo_path)
-        if not root.exists():
-            raise FileNotFoundError(f"Repository path does not exist: {repo_path}")
-        if not root.is_dir():
-            raise NotADirectoryError(f"Repository path is not a directory: {repo_path}")
-
-        target_path = (root / file_path).resolve()
-        if not target_path.exists() or not target_path.is_file():
-            raise FileNotFoundError(f"File does not exist: {file_path}")
+        root = resolve_repository_root(repo_path, allowed_root=boundary_root)
+        target_path = resolve_repository_file(root, file_path)
 
         if target_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
             raise ValueError(
@@ -104,7 +119,7 @@ def create_mcp_server(
             )
 
         all_chunks = load_repository(root)
-        normalized_target = Path(file_path).as_posix()
+        normalized_target = target_path.relative_to(root).as_posix()
         file_chunks = [c for c in all_chunks if c["file_path"] == normalized_target]
         if not file_chunks:
             raise ValueError(f"No indexable content found in {file_path}")
@@ -115,24 +130,31 @@ def create_mcp_server(
         else:
             api_key = os.getenv("GROQ_API_KEY", "").strip()
             if api_key:
+                if not allow_external_model:
+                    raise PermissionError(
+                        "External model access is disabled. Set allow_external_model=true "
+                        "to send selected repository chunks to Groq."
+                    )
                 from .model import groq_model
 
                 explanation = groq_model(prompt, file_chunks)
             else:
-                chunk_summaries = ", ".join(
-                    f"{c['start_line']}-{c['end_line']}" for c in file_chunks
+                chunk_citations = " ".join(
+                    f"[{c['file_path']}:{c['start_line']}-{c['end_line']}]"
+                    for c in file_chunks
                 )
                 explanation = (
                     f"File '{normalized_target}' consists of {len(file_chunks)} chunk(s) "
-                    f"spanning lines {chunk_summaries}. Detailed implementation is cited below "
-                    f"[{normalized_target}:{file_chunks[0]['start_line']}-{file_chunks[-1]['end_line']}]."
+                    f"with these indexed source ranges: {chunk_citations}."
                 )
 
-        extracted = _extract_citations(explanation)
-        chunk_citations = [
-            f"{c['file_path']}:{c['start_line']}-{c['end_line']}" for c in file_chunks
-        ]
-        citations = extracted if extracted else chunk_citations
+        citations, citation_error = _validate_and_extract_citations(
+            explanation,
+            file_chunks,
+            repo_path=root,
+        )
+        if citation_error is not None:
+            raise ValueError(citation_error)
 
         return {
             "file_path": normalized_target,

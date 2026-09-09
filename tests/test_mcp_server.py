@@ -44,7 +44,7 @@ def test_search_code_returns_ranked_chunks_and_citations(tmp_path: Path) -> None
     readme.write_text("# Project Docs\nWorker service\n", encoding="utf-8")
 
     fake_embedding = lambda texts: [[1.0, 0.0] for _ in texts]
-    test_server = create_mcp_server(embedding_fn=fake_embedding)
+    test_server = create_mcp_server(embedding_fn=fake_embedding, allowed_root=tmp_path)
 
     async def _test() -> None:
         async with InMemoryTransport(test_server) as (read_stream, write_stream):
@@ -92,7 +92,7 @@ def test_explain_file_returns_explanation_and_citations(tmp_path: Path) -> None:
     def fake_model(prompt: str, chunks: object) -> str:
         return "Authenticates users via token check [src/auth.py:1-2]."
 
-    test_server = create_mcp_server(model_fn=fake_model)
+    test_server = create_mcp_server(model_fn=fake_model, allowed_root=tmp_path)
 
     async def _test() -> None:
         async with InMemoryTransport(test_server) as (read_stream, write_stream):
@@ -139,3 +139,97 @@ def test_explain_file_nonexistent_or_unsupported(tmp_path: Path) -> None:
 
 def test_server_and_mcp_aliases() -> None:
     assert server is mcp
+
+
+@pytest.mark.parametrize(
+    ("question", "k"),
+    [("", 4), ("x" * 501, 4), ("valid", 0), ("valid", 9), ("valid", True)],
+)
+def test_search_code_rejects_unbounded_inputs(tmp_path: Path, question: str, k: object) -> None:
+    test_server = create_mcp_server(
+        embedding_fn=lambda texts: [[1.0] for _ in texts],
+        allowed_root=tmp_path,
+    )
+
+    async def _test() -> None:
+        async with InMemoryTransport(test_server) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                res = await session.call_tool(
+                    "search_code",
+                    arguments={"repo_path": str(tmp_path), "question": question, "k": k},
+                )
+                assert res.is_error
+
+    anyio.run(_test)
+
+
+def test_explain_file_rejects_traversal_outside_repository(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (tmp_path / "outside.py").write_text("secret = True\n", encoding="utf-8")
+    test_server = create_mcp_server(model_fn=lambda q, c: "unused", allowed_root=root)
+
+    async def _test() -> None:
+        async with InMemoryTransport(test_server) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                traversed = await session.call_tool(
+                    "explain_file",
+                    arguments={"repo_path": str(root), "file_path": "../outside.py"},
+                )
+                absolute = await session.call_tool(
+                    "explain_file",
+                    arguments={
+                        "repo_path": str(root),
+                        "file_path": str(tmp_path / "outside.py"),
+                    },
+                )
+                assert traversed.is_error
+                assert absolute.is_error
+
+    anyio.run(_test)
+
+
+def test_explain_file_rejects_fabricated_model_citation(tmp_path: Path) -> None:
+    source = tmp_path / "src" / "auth.py"
+    source.parent.mkdir()
+    source.write_text("def authenticate():\n    return True\n", encoding="utf-8")
+    other = tmp_path / "src" / "other.py"
+    other.write_text("value = 1\n", encoding="utf-8")
+    test_server = create_mcp_server(
+        model_fn=lambda q, c: "Fabricated source [src/other.py:1-1].",
+        allowed_root=tmp_path,
+    )
+
+    async def _test() -> None:
+        async with InMemoryTransport(test_server) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                res = await session.call_tool(
+                    "explain_file",
+                    arguments={"repo_path": str(tmp_path), "file_path": "src/auth.py"},
+                )
+                assert res.is_error
+
+    anyio.run(_test)
+
+
+def test_explain_file_requires_consent_before_groq(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "src" / "auth.py"
+    source.parent.mkdir()
+    source.write_text("def authenticate():\n    return True\n", encoding="utf-8")
+    monkeypatch.setenv("GROQ_API_KEY", "configured-but-must-not-be-used")
+    test_server = create_mcp_server(allowed_root=tmp_path)
+
+    async def _test() -> None:
+        async with InMemoryTransport(test_server) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                res = await session.call_tool(
+                    "explain_file",
+                    arguments={"repo_path": str(tmp_path), "file_path": "src/auth.py"},
+                )
+                assert res.is_error
+
+    anyio.run(_test)

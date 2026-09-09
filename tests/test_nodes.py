@@ -221,3 +221,12 @@ def test_fabricated_citation_causes_error(tmp_path: Path) -> None:
         "does not correspond to any retrieved chunk" in fabricated["errors"][0]
         or "does not exist under the selected repository" in fabricated["errors"][0]
     )
+
+
+def test_question_length_boundary_is_enforced_in_nodes() -> None:
+    blank = route_question(_state(question=" "))
+    oversized = route_question(_state(question="x" * 501))
+
+    assert blank["status"] == "error"
+    assert oversized["status"] == "error"
+    assert "Question" in oversized["errors"][0]

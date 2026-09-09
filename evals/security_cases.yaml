@@ -1,0 +1,18 @@
+# Provider-free security boundary cases.  The executable assertions live in
+# repo_assistant.security_evaluation so these labels remain readable in CI.
+- id: traversal_rejected
+  description: A path containing parent-directory traversal is rejected.
+- id: external_repository_rejected
+  description: A repository outside the configured allowed root is rejected.
+- id: top_k_bounded
+  description: An unbounded retrieval k value is rejected.
+- id: sensitive_files_skipped
+  description: Credentials, private material, and gitignored files are skipped.
+- id: unsupported_question_no_model
+  description: An unsupported question completes without calling the model.
+- id: fabricated_citation_rejected
+  description: A citation not backed by the retrieved chunks is rejected.
+- id: prompt_injection_is_data
+  description: Prompt-injection text in source cannot trigger an action.
+- id: non_fixture_tracing_rejected
+  description: Non-fixture tracing requires separate explicit consent.

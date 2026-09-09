@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-evaluate:
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Create virtual environment
+        shell: pwsh
+        run: python -m venv .venv
+
+      - name: Install dependencies and security tooling
+        shell: pwsh
+        run: |
+          .\.venv\Scripts\python.exe -m pip install --upgrade pip
+          .\.venv\Scripts\python.exe -m pip install -r requirements.txt ruff pip-audit
+
+      - name: Ruff
+        shell: pwsh
+        run: .\.venv\Scripts\python.exe -m ruff check src tests --ignore SIM117
+
+      - name: Provider-free tests
+        shell: pwsh
+        run: |
+          $env:PYTHONPATH = "src"
+          .\.venv\Scripts\python.exe -m pytest -q tests -p no:cacheprovider --basetemp .day13-test-temp
+
+      - name: Keyword retrieval evaluation
+        shell: pwsh
+        run: |
+          $env:PYTHONPATH = "src"
+          .\.venv\Scripts\python.exe -m repo_assistant.evaluation --mode keyword
+
+      - name: Security evaluation
+        shell: pwsh
+        env:
+          LANGSMITH_TRACING: "false"
+          LANGCHAIN_TRACING_V2: "false"
+        run: |
+          $env:PYTHONPATH = "src"
+          .\.venv\Scripts\python.exe -m repo_assistant.security_evaluation
+
+      - name: Dependency audit
+        shell: pwsh
+        run: .\.venv\Scripts\python.exe -m pip_audit -r requirements.txt
+
+      - name: Dependency consistency
+        shell: pwsh
+        run: .\.venv\Scripts\python.exe -m pip check
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Scan for secrets
+        uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
