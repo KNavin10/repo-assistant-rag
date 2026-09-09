@@ -14,6 +14,11 @@ from typing import Any, cast
 from .loader import RepositoryChunk
 from .loader import load_repository as _load_repository
 from .retrieval import DEFAULT_HYBRID_TOP_K, DEFAULT_MIN_VECTOR_SCORE, hybrid_search
+from .security import (
+    resolve_repository_file,
+    resolve_repository_root,
+    validate_question,
+)
 from .state import Route
 
 State = Mapping[str, object]
@@ -50,16 +55,12 @@ def validate_repository(state: State) -> StateUpdate:
     if not isinstance(raw_path, (str, Path)) or not str(raw_path).strip():
         return _error_state("Repository path is missing.")
 
-    repository_path = Path(raw_path)
     try:
-        if not repository_path.exists():
-            return _error_state(f"Repository path does not exist: {repository_path}")
-        if not repository_path.is_dir():
-            return _error_state(f"Repository path is not a directory: {repository_path}")
-    except OSError as exc:
-        return _error_state(f"Could not inspect repository path {repository_path}: {exc}")
+        repository_path = resolve_repository_root(raw_path)
+    except (OSError, TypeError, ValueError) as exc:
+        return _error_state(f"Could not inspect repository path {raw_path}: {exc}")
 
-    return {"status": "running", "errors": []}
+    return {"repo_path": str(repository_path), "status": "running", "errors": []}
 
 
 def load_repository(state: State) -> StateUpdate:
@@ -81,11 +82,13 @@ def route_question(state: State) -> StateUpdate:
     """Classify a request as a repository question, summary, or unsupported."""
 
     question = state.get("question")
-    if not isinstance(question, str) or not question.strip():
-        return {"route": "unsupported", "status": "running", "errors": []}
+    try:
+        normalized_question = validate_question(question)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        return {"route": "unsupported", **_error_state(str(exc))}
 
-    is_repository_request = bool(_REPOSITORY_RE.search(question))
-    is_summary_request = bool(_SUMMARY_RE.search(question))
+    is_repository_request = bool(_REPOSITORY_RE.search(normalized_question))
+    is_summary_request = bool(_SUMMARY_RE.search(normalized_question))
 
     if is_summary_request and is_repository_request:
         route: Route = "repo_summary"
@@ -107,14 +110,16 @@ def retrieve_context(
 
     question = state.get("question")
     raw_chunks = state.get("chunks", [])
-    if not isinstance(question, str):
-        return _error_state("Question is missing.")
+    try:
+        normalized_question = validate_question(question)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        return _error_state(str(exc))
     if not isinstance(raw_chunks, Sequence) or isinstance(raw_chunks, (str, bytes)):
         return _error_state("Repository chunks are invalid.")
 
     chunks = cast(Sequence[RepositoryChunk], raw_chunks)
     matches = hybrid_search(
-        question,
+        normalized_question,
         chunks,
         top_k=top_k,
         min_vector_score=min_vector_score,
@@ -167,11 +172,14 @@ def _validate_and_extract_citations(
         return [], "Answer generation must include a citation in path:start_line-end_line format."
 
     citations: list[str] = []
-    repo_root = (
-        Path(repo_path)
-        if isinstance(repo_path, (str, Path)) and str(repo_path).strip()
-        else None
-    )
+    try:
+        repo_root = (
+            resolve_repository_root(repo_path)
+            if isinstance(repo_path, (str, Path)) and str(repo_path).strip()
+            else None
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        return [], f"Could not inspect selected repository for citations: {exc}"
 
     for match in matches:
         path = match.group("path")
@@ -198,10 +206,8 @@ def _validate_and_extract_citations(
 
         # Every cited path must exist under the selected repository
         if repo_root is not None:
-            cited_file = repo_root / path
-            if not cited_file.is_file():
-                return [], f"Cited path does not exist under the selected repository: {path}"
             try:
+                cited_file = resolve_repository_file(repo_root, path)
                 line_count = len(
                     cited_file.read_text(encoding="utf-8", errors="replace").splitlines()
                 )
@@ -210,8 +216,10 @@ def _validate_and_extract_citations(
                         [],
                         f"Citation line range {start}-{end} exceeds file length ({line_count} lines): {path}",
                     )
-            except OSError as exc:
-                return [], f"Could not inspect cited file {path}: {exc}"
+            except FileNotFoundError:
+                return [], f"Cited path does not exist under the selected repository: {path}"
+            except (OSError, TypeError, ValueError) as exc:
+                return [], f"Cited path is invalid under the selected repository: {path}: {exc}"
 
         citation = f"{path}:{start}-{end}"
         if citation not in citations:
@@ -230,8 +238,10 @@ def generate_answer(state: State, model_fn: ModelFn | None = None) -> StateUpdat
 
     raw_chunks = state.get("chunks", [])
     question = state.get("question")
-    if not isinstance(question, str) or not question.strip():
-        return _error_state("Question is missing.")
+    try:
+        normalized_question = validate_question(question)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        return _error_state(str(exc))
     if not isinstance(raw_chunks, Sequence) or isinstance(raw_chunks, (str, bytes)):
         return _error_state("Retrieved chunks are invalid.")
 
@@ -247,7 +257,7 @@ def generate_answer(state: State, model_fn: ModelFn | None = None) -> StateUpdat
         return _error_state("No model_fn was provided for answer generation.")
 
     try:
-        answer = model_fn(question, chunks)
+        answer = model_fn(normalized_question, chunks)
     except Exception as exc:  # noqa: BLE001 - adapters may expose provider-specific errors
         return _error_state(f"Answer generation failed: {exc}")
 
@@ -283,6 +293,9 @@ def handle_failure(state: State) -> StateUpdate:
         if isinstance(errors, Sequence) and not isinstance(errors, (str, bytes))
         else []
     )
+
+    if status == "error" and messages:
+        return {"answer": messages[0], "status": "error", "errors": messages}
 
     if route == "unsupported":
         message = "I can only answer questions about the repository."
